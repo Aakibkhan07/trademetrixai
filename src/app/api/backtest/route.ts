@@ -11,14 +11,16 @@ import type { OHLCV } from "@/lib/signal-engine";
 const YAHOO_TICKERS: Record<string, string> = {
   "NIFTY": "^NSEI",
   "NIFTY 50": "^NSEI",
+  "NIFTY50": "^NSEI",
   "BANKNIFTY": "^NSEBANK",
+  "BANK NIFTY": "^NSEBANK",
   "RELIANCE": "RELIANCE.NS",
   "TCS": "TCS.NS",
   "INFY": "INFY.NS",
   "HDFCBANK": "HDFCBANK.NS",
   "ICICIBANK": "ICICIBANK.NS",
   "SBIN": "SBIN.NS",
-  "TATAMOTORS": "TATAMOTORS.NS",
+  "SENSEX": "^BSESN",
 };
 
 async function fetchHistoricalData(symbol: string, period = "6mo", interval = "1d"): Promise<OHLCV[]> {
