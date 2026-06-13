@@ -1,0 +1,852 @@
+"use client";
+
+import { useState, useEffect, useRef, useCallback } from "react";
+import { motion, AnimatePresence } from "motion/react";
+import { Check, ShieldCheck, Clock, Layers, ArrowUpRight, ArrowDownRight, X, TrendingUp, TrendingDown, Target, AlertTriangle, Zap } from "lucide-react";
+import { Header } from "@/components/layout/Header";
+import { GlassCard } from "@/components/ui/GlassCard";
+import { StatusBadge } from "@/components/ui/StatusBadge";
+import { ConfidenceMeter } from "@/components/ui/ConfidenceMeter";
+import { ProbabilityBar } from "@/components/ui/ProbabilityBar";
+import { signals } from "@/lib/dummy-data";
+import { cn, getTimeAgo } from "@/lib/utils";
+import { useMarketData } from "@/components/providers/MarketDataContext";
+import { useDemo } from "@/components/providers/DemoContext";
+import { Loader2 } from "lucide-react";
+import { addTrade, closeTrade, updateTrade } from "@/lib/trade-store";
+
+type FilterType = "ALL" | "BUY" | "SELL" | "HIGH_CONFIDENCE";
+
+interface SignalToast {
+  id: string;
+  type: "entry" | "exit-target" | "exit-sl";
+  symbol: string;
+  contract?: string;
+  direction: string;
+  price: number;
+  targetOrSl?: number;
+  pnlPercent?: number;
+  timestamp: number;
+  exiting?: boolean;
+}
+
+const containerVariants = {
+  hidden: { opacity: 0 },
+  show: { opacity: 1, transition: { staggerChildren: 0.08 } },
+};
+
+const cardVariants = {
+  hidden: { opacity: 0, y: 20 },
+  show: { opacity: 1, y: 0, transition: { type: "spring", stiffness: 100 } as const },
+  exit: { opacity: 0, scale: 0.95, transition: { duration: 0.2 } as const },
+};
+
+export default function AiSignalsPage() {
+  const [activeFilter, setActiveFilter] = useState<FilterType>("ALL");
+  const [executingSignalId, setExecutingSignalId] = useState<string | null>(null);
+
+  const { tickers, openAlgoConfig, openAlgoStatus, placeOpenAlgoOrder } = useMarketData();
+  const { role, openLeadModal, injectNotification } = useDemo();
+
+  // Signal toast popup state
+  const [signalToasts, setSignalToasts] = useState<SignalToast[]>([]);
+  const triggeredEventsRef = useRef<Set<string>>(new Set());
+
+  const addSignalToast = useCallback((toast: Omit<SignalToast, "id" | "timestamp">) => {
+    const newToast: SignalToast = {
+      ...toast,
+      id: `toast-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      timestamp: Date.now(),
+    };
+    setSignalToasts((prev) => [newToast, ...prev].slice(0, 5));
+
+    // Auto-dismiss after 6s with exit animation
+    setTimeout(() => {
+      setSignalToasts((prev) =>
+        prev.map((t) => (t.id === newToast.id ? { ...t, exiting: true } : t))
+      );
+      setTimeout(() => {
+        setSignalToasts((prev) => prev.filter((t) => t.id !== newToast.id));
+      }, 450);
+    }, 6000);
+  }, []);
+
+  const dismissToast = useCallback((id: string) => {
+    setSignalToasts((prev) =>
+      prev.map((t) => (t.id === id ? { ...t, exiting: true } : t))
+    );
+    setTimeout(() => {
+      setSignalToasts((prev) => prev.filter((t) => t.id !== id));
+    }, 450);
+  }, []);
+
+  const handleExecuteSetup = async (sig: any) => {
+    if (role === "user") {
+      openLeadModal(sig.symbol + " - " + sig.direction + " Setup");
+      return;
+    }
+
+    setExecutingSignalId(sig.id);
+
+    // Common trade properties
+    const quantity = sig.symbol.includes("BANKNIFTY") ? 15 : sig.symbol.includes("NIFTY") ? 50 : 100;
+    const tradeData = {
+      uid: "demo-user",
+      date: new Date().toISOString().split("T")[0],
+      symbol: sig.symbol,
+      direction: sig.direction as "BUY" | "SELL",
+      strategy: sig.signalType || "AI Signals Engine",
+      entryPrice: sig.entry,
+      exitPrice: null,
+      quantity,
+      pnl: 0,
+      pnlPercent: 0,
+      fees: 40.0, // brokerage
+      netPnl: 0,
+      notes: sig.reasoning?.join(" | ") || "AI generated setup executed.",
+      tags: ["AI-Signal", sig.signalStrength || "Strong"],
+      duration: "0m",
+      optionType: sig.optionTradeSetup 
+        ? (sig.optionTradeSetup.contract.endsWith("CE") ? ("CE" as const) : ("PE" as const)) 
+        : ("NA" as const),
+      strikePrice: sig.optionTradeSetup ? sig.optionTradeSetup.premiumEntry : undefined,
+      status: "open" as const,
+    };
+
+    let tradeRecordId = "";
+    try {
+      tradeRecordId = await addTrade(tradeData);
+      // Map the local ID to the signal in memory and localStorage so we can track exiting later
+      setLiveSignals((prev) => {
+        const updated = prev.map((s) => (s.id === sig.id ? { ...s, tradeRecordId } : s));
+        saveLiveSignals(updated);
+        return updated;
+      });
+    } catch (e) {
+      console.error("Failed to register trade", e);
+    }
+
+    // If OpenAlgo is active and connected:
+    const isOpenAlgoActive = openAlgoConfig.enabled && openAlgoStatus === "connected";
+    if (isOpenAlgoActive) {
+      try {
+        const optionSymbol = sig.optionTradeSetup?.contract?.replace(/\s+/g, "") || sig.symbol; // e.g. NIFTY23400CE
+        const exchange = sig.symbol.includes("NIFTY") || sig.symbol.includes("SENSEX") ? "NFO" : "NSE";
+
+        const orderRes = await placeOpenAlgoOrder({
+          symbol: optionSymbol,
+          action: sig.direction, // BUY or SELL
+          exchange: exchange,
+          quantity,
+          priceType: "MARKET",
+          product: "MIS",
+          strategy: "AI Signals Engine"
+        });
+
+        if (orderRes.success) {
+          injectNotification(
+            "Signal Setup Executed",
+            `Successfully placed trade for ${optionSymbol} via OpenAlgo. Order ID: ${orderRes.orderId}`,
+            "success"
+          );
+          if (tradeRecordId) {
+            await updateTrade(tradeRecordId, { brokerOrderId: orderRes.orderId, broker: "OpenAlgo" });
+          }
+        } else {
+          injectNotification(
+            "Execution Rejected",
+            `OpenAlgo rejected order placement: ${orderRes.error}`,
+            "warning"
+          );
+        }
+      } catch (err: any) {
+        injectNotification("Execution Error", err.message || "Failed to route order to OpenAlgo.", "warning");
+      } finally {
+        setExecutingSignalId(null);
+      }
+    } else {
+      // Simulate order routing with local feedback
+      setTimeout(() => {
+        injectNotification(
+          "Setup Executed",
+          `Placed trade for ${sig.optionTradeSetup?.contract || sig.symbol} (${sig.direction}) on active portfolio.`,
+          "success"
+        );
+        setExecutingSignalId(null);
+      }, 1000);
+    }
+  };
+
+  const [liveSignals, setLiveSignals] = useState<any[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [scanError, setScanError] = useState<string | null>(null);
+
+  // Save signals to localStorage helper
+  const saveLiveSignals = (updated: any[]) => {
+    try {
+      const trimmed = updated.slice(0, 50);
+      localStorage.setItem("tm_live_signals", JSON.stringify(trimmed));
+    } catch (e) {
+      console.error("Failed to save live signals:", e);
+    }
+  };
+
+  // Fetch real signals from the /api/signals route
+  const fetchRealSignals = useCallback(async (isInitial = false) => {
+    setIsLoading(true);
+    setScanError(null);
+    try {
+      const response = await fetch("/api/signals?scan=true");
+      if (!response.ok) throw new Error("Failed to scan signals");
+      const data = await response.json();
+      if (data.success && Array.isArray(data.signals)) {
+        // Map API signals to page signals
+        const mapped = data.signals.map((sig: any) => ({
+          id: sig.id || `sig-${sig.symbol}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          symbol: sig.symbol,
+          direction: sig.direction,
+          confidenceScore: sig.confidenceScore,
+          probability: sig.probability,
+          entry: sig.entry,
+          stopLoss: sig.stopLoss,
+          target: sig.target,
+          expectedRR: sig.expectedRR,
+          signalStrength: sig.signalStrength === "STRONG" ? "Strong" : sig.signalStrength === "MODERATE" ? "Moderate" : "Weak",
+          generatedTime: sig.generatedAt || new Date().toISOString(),
+          reasoning: sig.reasoning,
+          qualityScore: sig.qualityScore || 85,
+          status: sig.status || "active",
+          timeframe: sig.timeframe || "15m",
+          optionTradeSetup: sig.optionTradeSetup ? {
+            contract: sig.optionTradeSetup.contract,
+            premiumEntry: sig.optionTradeSetup.premiumEntry,
+            premiumSL: sig.optionTradeSetup.premiumSL,
+            premiumStopLoss: sig.optionTradeSetup.premiumSL,
+            premiumTarget: sig.optionTradeSetup.premiumTarget,
+            impliedVolatility: sig.optionTradeSetup.impliedVolatility,
+            delta: sig.optionTradeSetup.delta
+          } : undefined
+        }));
+
+        setLiveSignals((prev) => {
+          // Merge logic: keep all from API (mapped), but also keep previously exited/triggered ones so notifications/state persist
+          const merged = [...mapped];
+          prev.forEach((oldSig) => {
+            if (oldSig.status !== "active") {
+              if (!merged.some(s => s.id === oldSig.id || (s.symbol === oldSig.symbol && s.entry === oldSig.entry && s.direction === oldSig.direction))) {
+                merged.push(oldSig);
+              }
+            }
+          });
+
+          // Sort by generated time (newest first)
+          merged.sort((a, b) => new Date(b.generatedTime).getTime() - new Date(a.generatedTime).getTime());
+
+          // If NOT initial mount, detect new signals to play sound/pop toast
+          if (!isInitial) {
+            mapped.forEach((newSig: any) => {
+              const alreadyExists = prev.some(s => s.symbol === newSig.symbol && s.direction === newSig.direction && Math.abs(s.entry - newSig.entry) < 1);
+              if (!alreadyExists) {
+                // Pop up entry toast!
+                addSignalToast({
+                  type: "entry",
+                  symbol: newSig.symbol,
+                  contract: newSig.optionTradeSetup?.contract,
+                  direction: newSig.direction,
+                  price: newSig.entry,
+                });
+
+                injectNotification(
+                  `🚨 Live AI Signal: ${newSig.symbol}`,
+                  `New option setup identified: ${newSig.optionTradeSetup?.contract || newSig.symbol} at ₹${newSig.optionTradeSetup?.premiumEntry || newSig.entry} (Target: ₹${newSig.optionTradeSetup?.premiumTarget || newSig.target}).`,
+                  newSig.direction === "BUY" ? "success" : "warning"
+                );
+
+                // Broadcast to Telegram if configured
+                try {
+                  const saved = localStorage.getItem("tm_telegram_config");
+                  if (saved) {
+                    const config = JSON.parse(saved);
+                    if (config.isConnected && config.autoSend && config.botToken && config.chatId) {
+                      const isPlaceholderToken = config.botToken === "1928471029:AAFj3l_9L2984kLas928skLa0192LkdA" || !config.botToken.trim();
+                      const isPlaceholderChat = config.chatId === "-1001928374829" || !config.chatId.trim();
+
+                      if (!isPlaceholderToken && !isPlaceholderChat) {
+                        const rawText = config.template || `🚀 *Trade Metrix AI Signal*\n\n📊 {symbol} — *{direction}*\n\n▶️ Entry: {entry}\n🛑 Stop Loss: {stopLoss}\n🎯 Target: {target}`;
+                        const formattedText = rawText
+                          .replace("{symbol}", newSig.optionTradeSetup?.contract || newSig.symbol)
+                          .replace("{direction}", newSig.direction === "BUY" ? "BUY (LONG)" : "SELL (SHORT)")
+                          .replace("{entry}", `₹${newSig.optionTradeSetup?.premiumEntry || newSig.entry}`)
+                          .replace("{stopLoss}", `₹${newSig.optionTradeSetup?.premiumStopLoss || newSig.stopLoss}`)
+                          .replace("{target}", `₹${newSig.optionTradeSetup?.premiumTarget || newSig.target}`);
+
+                        let htmlText = formattedText.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+                        htmlText = htmlText.replace(/\*(.*?)\*/g, "<b>$1</b>");
+                        htmlText = htmlText.replace(/_(.*?)_/g, "<i>$1</i>");
+
+                        fetch(`https://api.telegram.org/bot${config.botToken}/sendMessage`, {
+                          method: "POST",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({
+                            chat_id: config.chatId,
+                            text: htmlText,
+                            parse_mode: "HTML"
+                          })
+                        }).catch(console.error);
+                      }
+                    }
+                  }
+                } catch (e) {
+                  console.error("Failed to forward signal to Telegram:", e);
+                }
+              }
+            });
+          }
+
+          saveLiveSignals(merged);
+          return merged;
+        });
+      }
+    } catch (err: any) {
+      console.error("Failed to fetch real signals:", err);
+      setScanError(err.message || "Failed to scan signals");
+    } finally {
+      setIsLoading(false);
+    }
+  }, [addSignalToast, injectNotification]);
+
+  // Load from localStorage or do initial fetch on mount
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem("tm_live_signals");
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          setLiveSignals(parsed);
+          fetchRealSignals(true);
+        } else {
+          fetchRealSignals(true);
+        }
+      } else {
+        fetchRealSignals(true);
+      }
+    } catch (e) {
+      fetchRealSignals(true);
+    }
+  }, []);
+
+  // Background polling loop
+  useEffect(() => {
+    const interval = setInterval(() => {
+      fetchRealSignals(false);
+    }, 60000); // Scan the market every 60 seconds
+
+    return () => clearInterval(interval);
+  }, [fetchRealSignals]);
+
+  const filteredSignals = liveSignals.filter((sig) => {
+    if (activeFilter === "BUY") return sig.direction === "BUY";
+    if (activeFilter === "SELL") return sig.direction === "SELL";
+    if (activeFilter === "HIGH_CONFIDENCE") return sig.confidenceScore >= 80;
+    return true;
+  });
+
+  const getStrengthColor = (strength: string) => {
+    switch (strength) {
+      case "Strong":
+        return "bg-neon-green";
+      case "Moderate":
+        return "bg-neon-blue";
+      default:
+        return "bg-neon-amber";
+    }
+  };
+
+  // Entry / Exit signal detection loop
+  useEffect(() => {
+    if (liveSignals.length === 0) return;
+
+    const checkInterval = setInterval(() => {
+      liveSignals.forEach((sig) => {
+        if (!sig || sig.status !== "active") return;
+        const tick = tickers[sig.symbol];
+        if (!tick) return;
+        const current = tick.price;
+        const isBuy = sig.direction === "BUY";
+        const eventKeyEntry = `entry-${sig.id}`;
+        const eventKeyTarget = `target-${sig.id}`;
+        const eventKeySL = `sl-${sig.id}`;
+
+        // ENTRY signal: price crosses the entry level
+        if (!triggeredEventsRef.current.has(eventKeyEntry)) {
+          if (isBuy && current >= sig.entry) {
+            triggeredEventsRef.current.add(eventKeyEntry);
+            addSignalToast({
+              type: "entry",
+              symbol: sig.symbol,
+              contract: sig.optionTradeSetup?.contract,
+              direction: sig.direction,
+              price: current,
+            });
+          } else if (!isBuy && current <= sig.entry) {
+            triggeredEventsRef.current.add(eventKeyEntry);
+            addSignalToast({
+              type: "entry",
+              symbol: sig.symbol,
+              contract: sig.optionTradeSetup?.contract,
+              direction: sig.direction,
+              price: current,
+            });
+          }
+        }
+
+        // TARGET HIT
+        if (!triggeredEventsRef.current.has(eventKeyTarget)) {
+          if (isBuy && current >= sig.target) {
+            triggeredEventsRef.current.add(eventKeyTarget);
+            const pnlPct = ((current - sig.entry) / sig.entry * 100);
+            addSignalToast({
+              type: "exit-target",
+              symbol: sig.symbol,
+              contract: sig.optionTradeSetup?.contract,
+              direction: sig.direction,
+              price: current,
+              targetOrSl: sig.target,
+              pnlPercent: Number(pnlPct.toFixed(2)),
+            });
+            if (sig.tradeRecordId) {
+              closeTrade(sig.tradeRecordId, sig.target);
+            }
+          } else if (!isBuy && current <= sig.target) {
+            triggeredEventsRef.current.add(eventKeyTarget);
+            const pnlPct = ((sig.entry - current) / sig.entry * 100);
+            addSignalToast({
+              type: "exit-target",
+              symbol: sig.symbol,
+              contract: sig.optionTradeSetup?.contract,
+              direction: sig.direction,
+              price: current,
+              targetOrSl: sig.target,
+              pnlPercent: Number(pnlPct.toFixed(2)),
+            });
+            if (sig.tradeRecordId) {
+              closeTrade(sig.tradeRecordId, sig.target);
+            }
+          }
+        }
+
+        // STOP-LOSS HIT
+        if (!triggeredEventsRef.current.has(eventKeySL)) {
+          if (isBuy && current <= sig.stopLoss) {
+            triggeredEventsRef.current.add(eventKeySL);
+            const pnlPct = ((current - sig.entry) / sig.entry * 100);
+            addSignalToast({
+              type: "exit-sl",
+              symbol: sig.symbol,
+              contract: sig.optionTradeSetup?.contract,
+              direction: sig.direction,
+              price: current,
+              targetOrSl: sig.stopLoss,
+              pnlPercent: Number(pnlPct.toFixed(2)),
+            });
+            if (sig.tradeRecordId) {
+              closeTrade(sig.tradeRecordId, sig.stopLoss);
+            }
+          } else if (!isBuy && current >= sig.stopLoss) {
+            triggeredEventsRef.current.add(eventKeySL);
+            const pnlPct = ((sig.entry - current) / sig.entry * 100);
+            addSignalToast({
+              type: "exit-sl",
+              symbol: sig.symbol,
+              contract: sig.optionTradeSetup?.contract,
+              direction: sig.direction,
+              price: current,
+              targetOrSl: sig.stopLoss,
+              pnlPercent: Number(pnlPct.toFixed(2)),
+            });
+            if (sig.tradeRecordId) {
+              closeTrade(sig.tradeRecordId, sig.stopLoss);
+            }
+          }
+        }
+      });
+    }, 2000);
+
+    return () => clearInterval(checkInterval);
+  }, [liveSignals, tickers, addSignalToast]);
+
+  return (
+    <div className="flex flex-col flex-1">
+      <Header title="AI Signal Engine" subtitle="Real-time AI-generated trading signals" />
+
+      {/* Signal Toast Popups */}
+      <div className="signal-toast-container">
+        <AnimatePresence>
+          {signalToasts.map((toast) => (
+            <motion.div
+              key={toast.id}
+              initial={{ opacity: 0, x: 100, scale: 0.85 }}
+              animate={{ opacity: 1, x: 0, scale: 1 }}
+              exit={{ opacity: 0, x: 120, scale: 0.85 }}
+              transition={{ type: "spring", stiffness: 300, damping: 25 }}
+              className={cn(
+                "signal-toast rounded-xl backdrop-blur-xl bg-surface-elevated/95 border border-glass-border p-4 cursor-pointer",
+                toast.exiting && "exiting",
+                toast.type === "entry" && "signal-toast-entry",
+                toast.type === "exit-target" && "signal-toast-target",
+                toast.type === "exit-sl" && "signal-toast-exit"
+              )}
+              onClick={() => dismissToast(toast.id)}
+            >
+              <div className="flex items-start gap-3">
+                {/* Icon */}
+                <div className={cn(
+                  "w-9 h-9 rounded-lg flex items-center justify-center shrink-0",
+                  toast.type === "entry" && "bg-neon-green/15",
+                  toast.type === "exit-target" && "bg-neon-blue/15",
+                  toast.type === "exit-sl" && "bg-neon-red/15"
+                )}>
+                  {toast.type === "entry" && <TrendingUp size={18} className="text-neon-green" />}
+                  {toast.type === "exit-target" && <Target size={18} className="text-neon-blue" />}
+                  {toast.type === "exit-sl" && <AlertTriangle size={18} className="text-neon-red" />}
+                </div>
+
+                {/* Content */}
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className={cn(
+                      "text-xs font-bold uppercase tracking-wide",
+                      toast.type === "entry" && "text-neon-green",
+                      toast.type === "exit-target" && "text-neon-blue",
+                      toast.type === "exit-sl" && "text-neon-red"
+                    )}>
+                      {toast.type === "entry" && "⚡ ENTRY SIGNAL"}
+                      {toast.type === "exit-target" && "🎯 TARGET ACHIEVED"}
+                      {toast.type === "exit-sl" && "🛑 STOP LOSS HIT"}
+                    </span>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); dismissToast(toast.id); }}
+                      className="text-text-muted hover:text-text-primary p-0.5 cursor-pointer"
+                    >
+                      <X size={12} />
+                    </button>
+                  </div>
+
+                  <div className="mt-1.5 flex items-center gap-2">
+                    <span className="text-sm font-bold text-text-primary">{toast.symbol}</span>
+                    <StatusBadge variant={toast.direction === "BUY" ? "buy" : "sell"}>
+                      {toast.direction}
+                    </StatusBadge>
+                  </div>
+
+                  {toast.contract && (
+                    <div className="text-[10px] font-mono text-neon-blue mt-1">
+                      {toast.contract}
+                    </div>
+                  )}
+
+                  <div className="flex items-center gap-3 mt-2">
+                    <span className="text-xs font-mono text-text-secondary">
+                      LTP: <span className="text-text-primary font-bold">₹{toast.price.toLocaleString("en-IN")}</span>
+                    </span>
+                    {toast.pnlPercent !== undefined && (
+                      <span className={cn(
+                        "text-xs font-bold font-mono px-1.5 py-0.5 rounded",
+                        toast.pnlPercent >= 0
+                          ? "text-neon-green bg-neon-green/10"
+                          : "text-neon-red bg-neon-red/10"
+                      )}>
+                        {toast.pnlPercent >= 0 ? "+" : ""}{toast.pnlPercent}%
+                      </span>
+                    )}
+                  </div>
+
+                  {/* Timestamp */}
+                  <div className="text-[9px] text-text-muted font-mono mt-1.5">
+                    {new Date(toast.timestamp).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
+                  </div>
+                </div>
+              </div>
+
+              {/* Progress bar auto-dismiss indicator */}
+              {!toast.exiting && (
+                <div className="mt-3 h-[2px] rounded-full bg-glass-border overflow-hidden">
+                  <motion.div
+                    className={cn(
+                      "h-full rounded-full",
+                      toast.type === "entry" && "bg-neon-green",
+                      toast.type === "exit-target" && "bg-neon-blue",
+                      toast.type === "exit-sl" && "bg-neon-red"
+                    )}
+                    initial={{ width: "100%" }}
+                    animate={{ width: "0%" }}
+                    transition={{ duration: 6, ease: "linear" }}
+                  />
+                </div>
+              )}
+            </motion.div>
+          ))}
+        </AnimatePresence>
+      </div>
+
+      <div className="p-6 space-y-6">
+        {/* Filters Tab Bar */}
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-glass-border pb-3">
+          <div className="flex flex-wrap items-center gap-2">
+            {(["ALL", "BUY", "SELL", "HIGH_CONFIDENCE"] as FilterType[]).map((filter) => (
+              <button
+                key={filter}
+                onClick={() => setActiveFilter(filter)}
+                className={`relative px-4 py-2 text-xs font-semibold uppercase tracking-wider rounded-xl transition-all duration-300 cursor-pointer ${
+                  activeFilter === filter
+                    ? "text-neon-blue bg-neon-blue/10 border border-neon-blue/20"
+                    : "text-text-secondary hover:text-text-primary border border-transparent hover:bg-white/5"
+                }`}
+              >
+                {filter.replace("_", " ")}
+              </button>
+            ))}
+          </div>
+          
+          <button
+            onClick={() => fetchRealSignals(false)}
+            disabled={isLoading}
+            className="flex items-center justify-center gap-1.5 px-4 py-2 text-xs font-bold uppercase tracking-wider rounded-xl bg-neon-blue/10 hover:bg-neon-blue/20 text-neon-blue border border-neon-blue/20 disabled:opacity-50 transition-all cursor-pointer shadow-[0_0_12px_rgba(0,212,255,0.05)] hover:shadow-[0_0_18px_rgba(0,212,255,0.15)]"
+          >
+            {isLoading ? (
+              <>
+                <Loader2 size={13} className="animate-spin" />
+                Scanning Market...
+              </>
+            ) : (
+              <>
+                <Zap size={13} />
+                Scan Market
+              </>
+            )}
+          </button>
+        </div>
+
+        {/* Signals Grid */}
+        <motion.div
+          variants={containerVariants}
+          initial="hidden"
+          animate="show"
+          className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6"
+        >
+          <AnimatePresence mode="popLayout">
+            {filteredSignals.map((sig, idx) => {
+              const isBuy = sig.direction === "BUY";
+              const tick = tickers[sig.symbol];
+
+              // Live signal state monitoring logic
+              let liveStatusText = isBuy ? "BUY / LONG" : "SELL / SHORT";
+              let statusBadgeVariant: "buy" | "sell" | "info" | "warning" = isBuy ? "buy" : "sell";
+
+              if (tick) {
+                const current = tick.price;
+                if (isBuy) {
+                  if (current >= sig.target) {
+                    liveStatusText = "TARGET ACHIEVED";
+                    statusBadgeVariant = "buy";
+                  } else if (current <= sig.stopLoss) {
+                    liveStatusText = "STOP LOSS TRIGGERED";
+                    statusBadgeVariant = "sell";
+                  } else if (current >= sig.entry) {
+                    const profitPct = ((current - sig.entry) / sig.entry * 100).toFixed(2);
+                    liveStatusText = `ACTIVE (IN PROFIT +${profitPct}%)`;
+                    statusBadgeVariant = "buy";
+                  } else {
+                    liveStatusText = "ACTIVE (IN ENTRY ZONE)";
+                    statusBadgeVariant = "info";
+                  }
+                } else { // SELL
+                  if (current <= sig.target) {
+                    liveStatusText = "TARGET ACHIEVED";
+                    statusBadgeVariant = "buy";
+                  } else if (current >= sig.stopLoss) {
+                    liveStatusText = "STOP LOSS TRIGGERED";
+                    statusBadgeVariant = "sell";
+                  } else if (current <= sig.entry) {
+                    const profitPct = ((sig.entry - current) / sig.entry * 100).toFixed(2);
+                    liveStatusText = `ACTIVE (IN PROFIT +${profitPct}%)`;
+                    statusBadgeVariant = "buy";
+                  } else {
+                    liveStatusText = "ACTIVE (IN ENTRY ZONE)";
+                    statusBadgeVariant = "info";
+                  }
+                }
+              }
+
+              return (
+                <motion.div
+                  key={sig.id || idx}
+                  variants={cardVariants}
+                  layout
+                  className="signal-card-new"
+                >
+                  <GlassCard
+                    className={`border border-glass-border hover:border-${
+                      isBuy ? "neon-green" : "neon-red"
+                    }/40 h-full flex flex-col justify-between relative overflow-hidden`}
+                    glow={isBuy ? "green" : "red"}
+                    hover
+                  >
+                    {/* Top corner quality and ticker price */}
+                    <div className="absolute top-4 right-4 flex flex-col items-end gap-1.5 z-10">
+                      <div className="flex items-center gap-1 bg-white/5 px-2 py-0.5 rounded-lg border border-glass-border text-[10px] font-mono text-neon-blue">
+                        <ShieldCheck size={10} />
+                        Q: {sig.qualityScore}
+                      </div>
+                      {tick && (
+                        <div className={cn(
+                          "text-[10px] font-mono font-bold px-1.5 py-0.5 rounded border bg-black/40",
+                          tick.changePercent >= 0 ? "text-neon-green border-neon-green/20" : "text-neon-red border-neon-red/20"
+                        )}>
+                          ₹{tick.price.toLocaleString("en-IN")}
+                        </div>
+                      )}
+                    </div>
+
+                    <div>
+                      {/* Header */}
+                      <div className="flex items-center gap-3">
+                        <div className="flex flex-col">
+                          <h3 className="text-xl font-bold text-text-primary tracking-tight">{sig.symbol}</h3>
+                          <div className="flex items-center gap-2 mt-1">
+                            <span className="text-[10px] font-bold text-text-muted bg-white/5 px-2 py-0.5 rounded-md font-mono">
+                              {sig.timeframe}
+                            </span>
+                            <span className="flex items-center gap-1 text-[10px] text-text-secondary">
+                              <Clock size={10} />
+                              {getTimeAgo(sig.generatedTime)}
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Direction and circular gauge */}
+                      <div className="flex items-center justify-between mt-5">
+                        <div className="flex flex-col gap-1.5">
+                          <span className="text-xs text-text-secondary font-medium uppercase tracking-wider">Live Status</span>
+                          <StatusBadge variant={statusBadgeVariant} pulse={sig.status === "active"}>
+                            {liveStatusText}
+                          </StatusBadge>
+                        </div>
+                        <ConfidenceMeter score={sig.confidenceScore} size={65} strokeWidth={5} />
+                      </div>
+
+                      {/* Divider */}
+                      <div className="h-[1px] bg-glass-border/40 my-4" />
+
+                      {/* Targets & Sl Row */}
+                      <div className="grid grid-cols-3 gap-2 text-xs font-mono">
+                        <div>
+                          <span className="text-[10px] text-text-secondary block font-sans uppercase mb-1">Entry</span>
+                          <span className="text-text-primary font-bold text-sm">₹{sig.entry.toLocaleString("en-IN")}</span>
+                        </div>
+                        <div>
+                          <span className="text-[10px] text-text-secondary block font-sans uppercase mb-1">Stop Loss</span>
+                          <span className="text-neon-red font-bold text-sm">₹{sig.stopLoss.toLocaleString("en-IN")}</span>
+                        </div>
+                        <div>
+                          <span className="text-[10px] text-text-secondary block font-sans uppercase mb-1">Target</span>
+                          <span className="text-neon-green font-bold text-sm">₹{sig.target.toLocaleString("en-IN")}</span>
+                        </div>
+                      </div>
+
+                      {/* Option trade details if it's an Option trade */}
+                      {sig.optionTradeSetup && (
+                        <div className="mt-4 p-3 rounded-xl bg-neon-blue/5 border border-neon-blue/15 space-y-2">
+                          <div className="flex justify-between items-center text-xs">
+                            <span className="text-[10px] text-text-muted uppercase font-bold">Options Contract</span>
+                            <span className="text-neon-blue font-bold font-mono">{sig.optionTradeSetup.contract}</span>
+                          </div>
+                          <div className="grid grid-cols-2 gap-2 text-xs font-mono pt-2 border-t border-glass-border/35">
+                            <div>
+                              <span className="text-[9px] text-text-secondary block font-sans">Premium Entry</span>
+                              <span className="text-text-primary font-bold">₹{sig.optionTradeSetup.premiumEntry.toFixed(2)}</span>
+                            </div>
+                            <div>
+                              <span className="text-[9px] text-text-secondary block font-sans">Premium SL / Target</span>
+                              <span className="text-neon-red font-bold">₹{(sig.optionTradeSetup.premiumSL ?? sig.optionTradeSetup.premiumStopLoss ?? 0).toFixed(2)}</span>
+                              <span className="text-text-muted mx-1">/</span>
+                              <span className="text-neon-green font-bold">₹{(sig.optionTradeSetup.premiumTarget ?? 0).toFixed(2)}</span>
+                            </div>
+                            <div className="mt-1">
+                              <span className="text-[9px] text-text-secondary block font-sans">Implied Vol (IV)</span>
+                              <span className="text-text-primary font-bold">{(sig.optionTradeSetup.impliedVolatility ?? 0).toFixed(1)}%</span>
+                            </div>
+                            <div className="mt-1">
+                              <span className="text-[9px] text-text-secondary block font-sans">Option Delta</span>
+                              <span className={cn("font-bold font-mono", (sig.optionTradeSetup.delta ?? 0) >= 0 ? "text-neon-green" : "text-neon-red")}>
+                                {(sig.optionTradeSetup.delta ?? 0) > 0 ? "+" : ""}{(sig.optionTradeSetup.delta ?? 0).toFixed(2)}
+                              </span>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Probability bar */}
+                      <ProbabilityBar value={sig.probability} label="Hit Probability" className="mt-5" />
+
+                      {/* Strength / R:R */}
+                      <div className="flex items-center justify-between text-xs mt-4 py-2 px-3 rounded-lg bg-white/[0.01] border border-glass-border/30">
+                        <div className="flex items-center gap-1.5">
+                          <div className={`w-2 h-2 rounded-full ${getStrengthColor(sig.signalStrength)}`} />
+                          <span className="text-text-secondary font-medium">{sig.signalStrength} Signal</span>
+                        </div>
+                        <span className="text-text-primary font-bold">R:R {sig.expectedRR}</span>
+                      </div>
+
+                      {/* Reasoning list */}
+                      <div className="mt-5 space-y-2">
+                        <span className="text-[10px] text-text-secondary block uppercase tracking-wider font-semibold">
+                          AI Reasoning Analysis (SMC/ICT Rules)
+                        </span>
+                        <ul className="space-y-1.5 text-xs text-text-secondary">
+                          {sig.reasoning.map((item: string, index: number) => (
+                            <li key={index} className="flex items-start gap-2">
+                              <Check size={12} className="text-neon-green mt-0.5 shrink-0" />
+                              <span>{item}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    </div>
+
+                    {/* Footer / Trade Button */}
+                    <div className="mt-6 pt-4 border-t border-glass-border/40 flex items-center justify-between">
+                      <span className="text-[10px] text-text-muted font-mono">Engine: Metrix-AI-v4.1</span>
+                      <button
+                        onClick={() => handleExecuteSetup(sig)}
+                        disabled={executingSignalId === sig.id}
+                        className={`flex items-center gap-1 text-xs font-bold ${
+                          isBuy 
+                            ? "text-neon-green hover:text-neon-green/80 disabled:text-neon-green/50" 
+                            : "text-neon-red hover:text-neon-red/80 disabled:text-neon-red/50"
+                        } cursor-pointer disabled:cursor-not-allowed`}
+                      >
+                        {executingSignalId === sig.id ? (
+                          <>
+                            Executing...
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          </>
+                        ) : (
+                          <>
+                            Execute Setup
+                            {isBuy ? <ArrowUpRight size={14} /> : <ArrowDownRight size={14} />}
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  </GlassCard>
+                </motion.div>
+              );
+            })}
+          </AnimatePresence>
+        </motion.div>
+      </div>
+    </div>
+  );
+}
