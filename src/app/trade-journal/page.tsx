@@ -363,20 +363,21 @@ export default function TradeJournalPage() {
                 </thead>
                 <tbody className="divide-y divide-glass-border/30 text-xs">
                   {filteredTrades.map((trade) => {
-                    const isExpanded = expandedRow === trade.id;
+                    const tradeKey = trade.id || `trade-${trade.date}-${trade.symbol}`;
+                    const isExpanded = expandedRow === tradeKey;
                     const isProfit = trade.pnl >= 0;
                     return (
                       <Fragment key={trade.id}>
                         <tr
-                          key={trade.id}
-                          onClick={() => setExpandedRow(isExpanded ? null : trade.id)}
+                          key={trade.id || `trade-${trade.date}-${trade.symbol}`}
+                          onClick={() => setExpandedRow(isExpanded ? null : (trade.id || `trade-${trade.date}-${trade.symbol}`))}
                           className="hover:bg-white/[0.02] transition-colors cursor-pointer group"
                         >
                           <td className="py-3.5 pl-3 text-text-secondary font-mono">{trade.date}</td>
                           <td className="py-3.5 font-bold text-text-primary">
                             <div className="flex items-center gap-1.5 flex-wrap">
                               <span>{trade.symbol}</span>
-                              {!trade.id.startsWith("t-new-") && (
+                              {trade.id && !trade.id.startsWith("t-new-") && (
                                 <button
                                   onClick={(e) => {
                                     e.stopPropagation();

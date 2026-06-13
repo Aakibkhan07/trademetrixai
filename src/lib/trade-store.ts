@@ -19,6 +19,7 @@ const LOCAL_STORAGE_KEY = "tm_local_trades";
 // Initialize with some default historical trades if localStorage is empty
 const defaultTrades: TradeRecord[] = [
   {
+    id: "t-demo-0",
     uid: "demo-user",
     date: new Date(Date.now() - 3600000 * 24).toISOString().split("T")[0],
     symbol: "RELIANCE",
@@ -38,6 +39,7 @@ const defaultTrades: TradeRecord[] = [
     createdAt: new Date(Date.now() - 3600000 * 24).toISOString(),
   },
   {
+    id: "t-demo-1",
     uid: "demo-user",
     date: new Date(Date.now() - 3600000 * 48).toISOString().split("T")[0],
     symbol: "TCS",
@@ -57,6 +59,7 @@ const defaultTrades: TradeRecord[] = [
     createdAt: new Date(Date.now() - 3600000 * 48).toISOString(),
   },
   {
+    id: "t-demo-2",
     uid: "demo-user",
     date: new Date(Date.now() - 3600000 * 72).toISOString().split("T")[0],
     symbol: "INFY",
@@ -94,11 +97,21 @@ export async function getTrades(uid: string): Promise<TradeRecord[]> {
   if (typeof window === "undefined") return [];
   const stored = localStorage.getItem(LOCAL_STORAGE_KEY);
   if (!stored) {
-    localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(defaultTrades));
-    return defaultTrades;
+    // Add IDs to default trades if they don't have them
+    const defaultTradesWithIds = defaultTrades.map((trade, idx) => ({
+      ...trade,
+      id: trade.id || `t-demo-${idx}`,
+    }));
+    localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(defaultTradesWithIds));
+    return defaultTradesWithIds;
   }
   try {
-    return JSON.parse(stored);
+    const parsed = JSON.parse(stored);
+    // Ensure all trades have IDs
+    return parsed.map((trade: any, idx: number) => ({
+      ...trade,
+      id: trade.id || `t-fallback-${idx}`,
+    }));
   } catch (e) {
     return [];
   }

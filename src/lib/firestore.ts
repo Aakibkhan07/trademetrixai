@@ -91,7 +91,7 @@ export async function updateUserProfile(uid: string, data: Partial<UserProfile>)
 
 // ---- Trade Journal ----
 export interface TradeRecord {
-  id?: string;
+  id: string;
   uid: string;
   date: string;
   symbol: string;
