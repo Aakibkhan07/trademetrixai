@@ -148,6 +148,20 @@ export function DemoProvider({ children }: { children: React.ReactNode }) {
       return updated;
     });
 
+    // Send to n8n lead qualification webhook
+    fetch("https://n8n.trademetrix.tech/webhook/lead-qualify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name,
+        email,
+        phone,
+        capital: capVal,
+        broker,
+        message: `Interested in ${strategyContext || leadModalContext || "General Onboarding"} with ₹${capVal.toLocaleString()} capital via ${broker}`
+      })
+    }).catch(() => {});
+
     injectNotification(
       "Lead Registered",
       `Successfully registered routing interest for ${name} (₹${capVal.toLocaleString()} via ${broker}).`,
